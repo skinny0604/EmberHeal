@@ -42,6 +42,11 @@ end
 local function skinFrame(f, strata, bgA, br, bgg, bb)
 	local okN, baseName = pcall(f.GetName, f)
 	local skin = CreateFrame("Frame", (okN and baseName) and (baseName .. "Skin") or nil, UIParent)
+	-- (1.0.20) INPUT EATER: on this client a plain Frame is mouse-enabled by
+	-- default and swallows hover/click/drag for everything underneath (EH_Grid
+	-- documents the same trap: 必须 EnableMouse(false)，否则"点不动、拖不动、
+	-- hover 不出气泡"). The skin is a pure visual overlay → make it click-through.
+	pcall(skin.EnableMouse, skin, false)
 	skin:SetFrameStrata(strata)
 	skin:SetPoint("TOPLEFT", f, "TOPLEFT", 0, 0)
 	skin:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", 0, 0)
@@ -102,6 +107,9 @@ local function mkButton(parent, name, w, h, text, onClick)
 	b:SetWidth(w)
 	b:SetHeight(h)
 	b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	-- this engine gates ALL mouse input behind EnableMouse (unrealUI calls it
+	-- "the verified input gate"): a Button without it is click-through
+	pcall(b.EnableMouse, b, true)
 	if onClick then b:SetScript("OnClick", onClick) end
 	styleButton(b)
 	local lab = b:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
@@ -141,24 +149,43 @@ local function buildUnitButton(i)
 	pcall(b.RegisterForClicks, b,
 		"LeftButtonUp", "MiddleButtonUp", "RightButtonUp",
 		"MiddleButtonDown", "Button4Up", "Button5Up", "Button4Down", "Button5Down")
+	-- INPUT GATE (1.0.18): this engine delivers no mouse events to a Button
+	-- until EnableMouse(true) -- see unrealUI core/widgets.lua ("the verified
+	-- input gate used throughout unrealUI") and EvalHelp's buttons. Without
+	-- it the unit buttons were click-through and every click landed on the
+	-- grid's drag handler instead.
+	pcall(b.EnableMouse, b, true)
+	-- (1.0.19) raise above unrealUI's bottom-center panels: a MEDIUM-strata
+	-- frame under one of those never sees hover OR click
+	pcall(b.SetFrameStrata, b, "HIGH")
+	if i == 1 and EVH.diag then
+		local okM, en = pcall(b.IsMouseEnabled, b)
+		EVH.diag("unitBtn1 built mouseEnabled=" .. tostring(okM and tostring(en) or "?"))
+	end
 	-- this engine may still fire OnClick ONLY for left/right even when middle
 	-- is registered -> catch MiddleButton/Button4/Button5 in OnMouseUp too.
 	-- Mouse scripts can lack formal args here, so read the arg1 global.
 	-- fireUnitClick dedupes so the two paths never cast twice.
 	local lastClickBtn, lastClickT = nil, 0
+	local lastHover = nil
 	local function fireUnitClick(btnName)
 		if not btnName then return end
 		local now = (GetTime and GetTime() or 0)
 		if btnName == lastClickBtn and (now - lastClickT) < 0.25 then return end
 		lastClickBtn, lastClickT = btnName, now
 		if EVH.clickDebug then EV.dbug("dbg click: " .. btnName) end
+		EV.diag("rawclick btn=" .. tostring(btnName)
+			.. " unit=" .. tostring(b.evhMember and b.evhMember.unit)
+			.. " name=" .. tostring(b.evhMember and b.evhMember.name))
 		EV.handleUnitClick(b, btnName, btnName)
 	end
 	local onUnitClick = function(a1)
+		EV.diag("ubtn onclick a1=" .. tostring(a1) .. " arg1=" .. tostring(arg1))
 		fireUnitClick(EV.resolveButton(a1, arg1))
 	end
 	local onUnitMouseUp = function(a1)
 		local a = (type(a1) == "string" and a1) or arg1
+		EV.diag("ubtn mouseup a1=" .. tostring(a1) .. " arg1=" .. tostring(arg1))
 		if EVH.clickDebug then
 			local gmc = "no api"
 			if GetMouseButtonClicked then
@@ -171,21 +198,24 @@ local function buildUnitButton(i)
 			local okG, g = pcall(GetMouseButtonClicked)
 			if okG and type(g) == "string" then a = g end
 		end
-		if a == "MiddleButton" or a == "Button4" or a == "Button5" then
+		if a == "LeftButton" or a == "RightButton" or a == "MiddleButton"
+		   or a == "Button4" or a == "Button5" then
 			fireUnitClick(a)
 		end
 	end
 	b:SetScript("OnMouseDown", function(a1)
-		if EVH.clickDebug then
-			EV.dbug("dbg mousedown: a1=" .. tostring(a1) .. " arg1=" .. tostring(arg1))
-		end
+		EV.diag("ubtn mousedown a1=" .. tostring(a1) .. " arg1=" .. tostring(arg1))
 	end)
 	local onUnitLeave = function() GameTooltip:Hide() end
 	b:SetScript("OnClick", onUnitClick)
 	b:SetScript("OnMouseUp", onUnitMouseUp)
 	local onUnitEnter = function()
 		local m = b.evhMember
+		EV.diag("ubtn enter member=" .. tostring(m and m.name) .. " unit=" .. tostring(m and m.unit))
 		if not m then return end
+		if lastHover ~= m.name then
+			lastHover = m.name
+		end
 		GameTooltip:SetOwner(b, "ANCHOR_RIGHT")
 		local r, gg, bl = EV.classColor(m.class)
 		GameTooltip:SetText(m.name or "?", r, gg, bl)
@@ -224,8 +254,10 @@ local function buildUnitButton(i)
 	bar:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", -1, 1)
 	b.bar = bar
 	-- this engine may let a child StatusBar eat clicks aimed at the button:
-	-- strip its mouse, and mirror the handlers onto it as a fallback
-	pcall(bar.EnableMouse, bar, 0)
+	-- strip its mouse, and mirror the handlers onto it as a fallback.
+	-- (1.0.21) NOTE: EnableMouse(0) does NOT disable on this client -- 0 is
+	-- truthy in Lua -- only `false` takes.
+	pcall(bar.EnableMouse, bar, false)
 	pcall(bar.RegisterForClicks, bar, "LeftButtonUp", "MiddleButtonUp", "RightButtonUp", "Button4Up", "Button5Up")
 	pcall(bar.SetScript, bar, "OnClick", onUnitClick)
 	pcall(bar.SetScript, bar, "OnMouseUp", onUnitMouseUp)
@@ -240,7 +272,10 @@ local function buildUnitButton(i)
 	-- (no SetFrameLevel bump: this engine double-draws re-leveled frames).
 	local ov = CreateFrame("Frame", nil, b)
 	ov:SetAllPoints(b)
-	ov:EnableMouse(0)
+	-- (1.0.21) `false`, not 0: on this client EnableMouse(0) leaves the
+	-- overlay mouse-ON (0 is truthy), and it then eats every hover/click --
+	-- the GetMouseFocus probe caught exactly this unnamed child holding focus
+	ov:EnableMouse(false)
 	b.evhOverlay = ov
 
 	-- low-health / highlight overlay (tint, beneath the marks on this frame)
@@ -313,6 +348,29 @@ local function buildUnitButton(i)
 	edges[4]:SetPoint("BOTTOMRIGHT", b, "BOTTOMRIGHT", 0, 0)
 	edges[4]:SetWidth(2)
 	for k = 1, 4 do edges[k]:Hide() end
+
+	-- (1.0.21) INPUT FIX, re-asserted after every child exists: on this
+	-- engine a plain child Frame is mouse-ON by default and eats hover and
+	-- click for everything it covers. EnableMouse(0) did NOT disable (0 is
+	-- truthy in Lua); only `false` takes. bar + evhOverlay are the only
+	-- child frames, but sweep GetChildren too in case one is added later.
+	local nkids = 0
+	if b.GetChildren then
+		local raw = { pcall(b.GetChildren, b) }
+		for j = 2, #raw do
+			local kid = raw[j]
+			if type(kid) == "table" and kid.EnableMouse then
+				nkids = nkids + 1
+				pcall(kid.EnableMouse, kid, false)
+			end
+		end
+	end
+	if i == 1 and EVH.diag then
+		local _, om = pcall(ov.IsMouseEnabled, ov)
+		local _, bm = pcall(bar.IsMouseEnabled, bar)
+		EVH.diag("unitBtn1 1.0.21 kids=" .. nkids
+			.. " ovMouse=" .. tostring(om) .. " barMouse=" .. tostring(bm))
+	end
 
 	b:Hide()
 	return b
@@ -389,6 +447,23 @@ local function layoutGrid()
 		b:Hide()
 	end
 	g.shown = shown
+
+	-- (1.0.19) ground truth for hit-testing: the on-screen rect of the grid
+	-- and of the first visible unit button, logged after every layout
+	-- (consecutive identical lines collapse in EVH.diag)
+	do
+		local function rect(f)
+			local ok, l = pcall(f.GetLeft, f)
+			if not ok or l == nil then return "hidden" end
+			local _, r = pcall(f.GetRight, f)
+			local _, t = pcall(f.GetTop, f)
+			local _, bm = pcall(f.GetBottom, f)
+			return string.format("%.0f,%.0f - %.0f,%.0f", l or -1, t or -1, r or -1, bm or -1)
+		end
+		local b1 = shown >= 1 and g.buttons[1]
+		EVH.diag("grid rect [" .. rect(g.GridFrame) .. "] btn1 rect ["
+			.. (b1 and rect(b1) or "none") .. "] shown=" .. shown)
+	end
 
 	local colsN = #colKeys
 	local maxRows = 0
@@ -653,19 +728,18 @@ local function buildGrid()
 	g.GridFrame:SetMovable(1)
 	g.GridFrame:EnableMouse(1)
 	g.GridFrame:SetScript("OnMouseDown", function()
-		if EVH.clickDebug then
-			EV.dbug("dbg grid mousedown: arg1=" .. tostring(arg1))
-		end
+		EV.diag("GRID mousedown arg1=" .. tostring(arg1))
 		startGridDrag()
 	end)
 	g.GridFrame:SetScript("OnMouseUp", function()
-		if EVH.clickDebug then
-			EV.dbug("dbg grid mouseup: arg1=" .. tostring(arg1))
-		end
+		EV.diag("GRID mouseup arg1=" .. tostring(arg1))
 		stopGridDrag(true)
 	end)
 	g.GridFrame:SetScript("OnUpdate", gridDragUpdate)
-	g.GridFrame:SetFrameStrata("MEDIUM")
+	-- (1.0.19) HIGH so the grid and its buttons sit above unrealUI's
+	-- MEDIUM-strata bottom-center panels; children do NOT inherit a later
+	-- parent strata change, so the buttons set their own in buildUnitButton
+	g.GridFrame:SetFrameStrata("HIGH")
 	local okLv, lv = pcall(g.GridFrame.GetFrameLevel, g.GridFrame)
 	if okLv and lv and lv > 0 then g.skin:SetFrameLevel(lv - 1) end
 
@@ -1085,6 +1159,7 @@ local function buildMinimap()
 	mm:SetWidth(31)
 	mm:SetHeight(31)
 	mm:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	pcall(mm.EnableMouse, mm, true)
 	-- no self-drawn background square: the engine renders it as an opaque
 	-- black box behind the glyph (EmberLoot's button ships no bg either).
 	-- Highlight + golden tracking border only, glyph floats above the map.

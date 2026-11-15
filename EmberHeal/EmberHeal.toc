@@ -2,7 +2,7 @@
 ## Title: EmberHeal
 ## Notes: HealBot-style healing frame for Emberveil: raid/party health grid, click-casting via action slots, debuff/dispel icons, buff watch, range and aggro indicators, options panel. 治疗框架：团队血条网格、点击施法、驱散减益、增益监视、范围/仇恨提示。
 ## Author: skinny
-## Version: 1.0.14
+## Version: 1.0.22
 ## SavedVariables: EmberHeal_DB
 EmberHeal.lua
 EmberHeal_UI.lua

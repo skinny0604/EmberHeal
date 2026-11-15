@@ -31,6 +31,7 @@ local function onEvent(a, b)
 		EV.buildAll()
 		EV.refreshAll()
 		EV.applyMiddleCast()
+		EV.echo((EV.L.title or "EmberHeal") .. " " .. (EV.VERSION or "?") .. " 已加载 / loaded")
 	elseif ev == "PLAYER_ENTERING_WORLD" then
 		if EV.db() then
 			EV.buildRoster()
@@ -119,6 +120,17 @@ local function slashCmd(msg)
 		EVH.clickDebug = (o.clickDebug == 1)
 		EV.echo(EV.L.clickDbg .. " = " .. (EVH.clickDebug and EV.L.on or EV.L.off))
 		return
+	elseif msg == "diag" then
+		local d = EV.db().diag or {}
+		EV.echo("diag: " .. #d .. " entries (written to SavedVariables on logout/reload)")
+		for i = math.max(1, #d - 9), #d do
+			if d[i] then EV.echo(d[i]) end
+		end
+		return
+	elseif msg == "diagclear" then
+		EV.db().diag = {}
+		EV.echo("diag: cleared")
+		return
 	elseif msg == "size" then
 		local o = EV.db().opts
 		o.barSize = ((o.barSize or 2) % 3) + 1
@@ -147,3 +159,24 @@ SlashCmdList["EVH"] = slashCmd
 setglobal("SLASH_EMBERHEAL1", "/emberheal")
 setglobal("SLASH_EH1", "/eh")
 setglobal("SLASH_EVH1", "/evh")
+
+-- /ehrun <lua>: evaluate one line of Lua in the addon's environment and
+-- echo the first three return values -- remote diagnostics without needing
+-- a chat-log transcription. Kept case-sensitive (slashCmd lowercases).
+SlashCmdList["EHRUN"] = function(msg)
+	msg = string.gsub(msg or "", "^%s*(.-)%s*$", "%1")
+	if msg == "" then
+		EV.echo("/ehrun <lua code>  (result of the first 3 returns is echoed)")
+		return
+	end
+	local f, cerr = loadstring(msg)
+	if not f then
+		EV.echo("ehrun compile err: " .. tostring(cerr))
+		return
+	end
+	local ok, r1, r2, r3 = pcall(f)
+	if EV.diag then EV.diag("ehrun: " .. msg .. " => " .. tostring(r1) .. " " .. tostring(r2) .. " " .. tostring(r3)) end
+	EV.echo("ehrun ok=" .. tostring(ok)
+		.. " r1=" .. tostring(r1) .. " r2=" .. tostring(r2) .. " r3=" .. tostring(r3))
+end
+setglobal("SLASH_EHRUN1", "/ehrun")

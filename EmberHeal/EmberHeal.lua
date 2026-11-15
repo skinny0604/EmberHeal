@@ -2,16 +2,92 @@
 -- EmberHeal — HealBot-style healing frame for Emberveil
 -- Client: Emberveil (1.12.1 client / Lua 5.1)
 -- API notes (https://emberveil.org/wiki/lua):
---   * CastSpellByName / CastSpell / SpellTargetUnit are PROTECTED
---     (addons may not call them). Casting is done with TargetUnit(unit)
---     + UseAction(slot) on user-bound action-bar slots; self-casts use
---     UseAction(slot, nil, 1).
+--   * Emberveil does NOT protect casting functions ("No widget methods in
+--     this client are protected"; only explicitly-flagged globals are). So we
+--     cast by spell name: TargetUnit(unit) + CastSpellByName(name), resolved
+--     from the bound action slot via GetActionInfo/GetSpellName. UseAction is
+--     kept only as a fallback when a slot has no spell (item/macro/empty).
 --   * UnitBuff(unit, index) / UnitDebuff(unit, index) are 1-BASED and
 --     return (texture, stacks[, dispelType]) -> icons identified by
 --     texture path basename.
 --   * No UnitThreatSituation: aggro uses target-of-target + combat flag.
 --   * Buttons have no *FontObject methods here: SetText + Button:SetFont().
 -- =============================================================
+
+-- =============================================================
+-- Client-compat shim: GetDifficultyColor
+--
+-- The client's own Interface/FrameXML/TargetFrame.lua calls the global
+-- GetDifficultyColor(), which this client never defines:
+--
+--   [string "Interface/FrameXML/TargetFrame.lua"]:130:
+--   attempt to call global 'GetDifficultyColor' (a nil value)
+--     TargetFrame_CheckLevel (TargetFrame.lua:130)
+--     TargetFrame_Update     (TargetFrame.lua:41)
+--     TargetFrame_OnLoad     (TargetFrame.lua:20)
+--
+-- That is not only noise. The target-change dispatch is synchronous, so
+-- the error propagates straight back out of TargetUnit()/SetTarget() and
+-- aborts whatever the caller was doing. Click-casting targets a unit
+-- first, so it died inside TargetUnit() and never reached the spell.
+--
+-- The classic API hands back a colour TABLE of r/g/b floats (the shape
+-- classic frames use: local color = GetDifficultyColor(level);
+-- text:SetVertexColor(color.r, color.g, color.b)), so that is what is
+-- returned here.
+--
+-- Installed two ways on purpose: the plain assignment covers the normal
+-- case where addon code shares the client's global environment, and the
+-- client's own setglobal() covers the case where it does not.
+-- =============================================================
+local function installDifficultyColor()
+	local fn = function(level)
+		local lv = (type(UnitLevel) == "function" and UnitLevel("player")) or 1
+		local diff = (tonumber(level) or lv) - lv
+		local green = 10
+		if type(GetQuestGreenRange) == "function" then
+			local okq, g = pcall(GetQuestGreenRange)
+			if okq and type(g) == "number" and g > 0 then green = g end
+		end
+		local c
+		if diff >= 5 then
+			c = { r = 1.00, g = 0.10, b = 0.10 }     -- far above you
+		elseif diff >= 3 then
+			c = { r = 1.00, g = 0.50, b = 0.25 }     -- orange
+		elseif diff >= -2 then
+			c = { r = 1.00, g = 1.00, b = 0.00 }     -- yellow
+		elseif diff >= -green then
+			c = { r = 0.25, g = 0.75, b = 0.25 }     -- green
+		else
+			c = { r = 0.50, g = 0.50, b = 0.50 }     -- grey (no xp)
+		end
+		c.font = "QuestDifficulty_Standard"
+		return c
+	end
+	GetDifficultyColor = fn
+	if type(setglobal) == "function" then
+		pcall(setglobal, "GetDifficultyColor", fn)
+	end
+	return fn
+end
+installDifficultyColor()
+
+-- (1.0.22) The modal script-error box (the GetDifficultyColor popup at every
+-- login/reload) is not gated by any CVar -- SetCVar("scriptErrors","0") is
+-- accepted but the box still shows. Last lever: if the engine honors Lua's
+-- seterrorhandler, take over error reporting and route it into the diag
+-- trace instead of a modal dialog. This cannot stop the error itself (it
+-- fires during FrameXML bootstrap, before addons load), but if the box is
+-- displayed after the addon stage this handler intercepts it.
+pcall(function()
+	if type(seterrorhandler) == "function" then
+		seterrorhandler(function(err)
+			if EVH and EVH.diag then
+				EVH.diag("err: " .. string.sub(tostring(err), 1, 160))
+			end
+		end)
+	end
+end)
 
 EVH = EVH or {}
 
@@ -23,7 +99,7 @@ local strsub = string.sub
 local strlower = string.lower
 local strformat = string.format
 
-EVH.VERSION = "1.0.0"
+EVH.VERSION = "1.0.22"
 
 -- -------------------------------------------------------------
 -- Localization (zhCN / enUS, picked by client locale)
@@ -344,6 +420,7 @@ function EVH.loadDB()
 		db.opts.clickDebugForced = 2
 	end
 	EVH.clickDebug = (db.opts.clickDebug == 1)
+	EVH.diag("load v" .. tostring(EVH.VERSION) .. " api: " .. EVH.diagApiProbe())
 end
 
 -- -------------------------------------------------------------
@@ -361,6 +438,50 @@ function EVH.dbug(msg)
 	if UIErrorsFrame and UIErrorsFrame.AddMessage then
 		pcall(UIErrorsFrame.AddMessage, UIErrorsFrame, "|cffffcc00" .. tostring(msg) .. "|r", 1, 0.8, 0.2, 1, 4)
 	end
+end
+
+-- -------------------------------------------------------------
+-- Persistent diagnostic trace (1.0.17-local)
+-- Appends to db.diag, which the client serialises into
+-- SavedVariables/EmberHeal.lua at logout/reload, so the log can be read
+-- from disk after the fact -- no chat transcription needed. Capped at
+-- 400 lines; /eh diagclear wipes it. Consecutive duplicate lines are
+-- collapsed.
+-- -------------------------------------------------------------
+local DIAG_APIS = {
+	"GetActionInfo", "GetSpellName", "HasAction", "IsUsableAction",
+	"IsActionInRange", "UseAction", "CastSpellByName", "CastSpell",
+	"TargetUnit", "TargetByName", "ClearTarget", "UnitIsUnit",
+	"UnitExists", "UnitName", "UnitIsDeadOrGhost", "GetActionCooldown",
+}
+
+function EVH.diag(msg)
+	if not db then return end
+	if type(db.diag) ~= "table" then db.diag = {} end
+	local t = 0
+	if type(GetTime) == "function" then t = GetTime() end
+	local line = string.format("[%07.1f] %s", t, tostring(msg))
+	local n = #db.diag
+	if n == 0 or db.diag[n] ~= line then
+		n = n + 1
+		db.diag[n] = line
+		if n > 400 then table.remove(db.diag, 1) end
+	end
+	if EVH.clickDebug then EVH.echo("|cffffcc00" .. line .. "|r") end
+end
+
+-- one line summarising which cast-path APIs this client actually provides
+-- (F = function, - = missing, other prefixes for odd types)
+function EVH.diagApiProbe()
+	local parts = {}
+	for i, n in ipairs(DIAG_APIS) do
+		local v
+		if type(getglobal) == "function" then v = getglobal(n) end
+		if v == nil and _G then v = _G[n] end
+		local t = type(v)
+		parts[i] = n .. "=" .. (t == "function" and "F" or (t == "nil" and "-" or string.sub(t, 1, 2)))
+	end
+	return table.concat(parts, " ")
 end
 
 function EVH.basename(tex)
@@ -549,6 +670,35 @@ function EVH.slotName(slot)
 	return name
 end
 
+-- Resolve a bound action slot to its spell (name + id). Emberveil does NOT
+-- protect casting functions (wiki: "No widget methods in this client are
+-- protected"), so casting by name/id is the reliable path here. Returns nil
+-- when the slot holds no spell (item/macro/empty) so callers can keep
+-- UseAction.
+function EVH.slotSpellInfo(slot, verbose)
+	local okT, t, id = pcall(GetActionInfo, slot)
+	if verbose then
+		EVH.diag("slotInfo slot=" .. tostring(slot)
+			.. " gai=" .. type(GetActionInfo)
+			.. " type=" .. tostring(t) .. " id=" .. tostring(id)
+			.. (okT and "" or (" gaiErr=" .. tostring(t))))
+	end
+	if not okT then return nil end
+	if t ~= "spell" or not id then return nil end
+	local okN, nm = pcall(GetSpellName, id, "spell")
+	if not okN then nm = nil end
+	if nm == "" then nm = nil end
+	if verbose and not nm then
+		EVH.diag("spellName empty: gsn=" .. type(GetSpellName) .. " id=" .. tostring(id))
+	end
+	return nm, id
+end
+
+function EVH.slotSpellName(slot)
+	local nm = EVH.slotSpellInfo(slot)
+	return nm
+end
+
 function EVH.setBind(key, slot)
 	db.clicks[key] = slot
 end
@@ -581,53 +731,182 @@ function EVH.cycleBind(key)
 	return list[nextIdx]
 end
 
--- cast a bound action slot on a unit (safe target juggling)
+-- Set the target without letting a client-side UI error abort the caller.
+-- TargetUnit() dispatches the target change synchronously, and this client's
+-- FrameXML/TargetFrame.lua throws inside that dispatch (it calls a global
+-- the client does not define). That error used to propagate straight out of
+-- TargetUnit() and kill the click before the spell was ever cast. The
+-- target itself is already set when it happens, so an error is only fatal
+-- when the target really did not change -- hence the UnitIsUnit() check.
+-- Returns: ok, err
+function EVH.setTargetSafe(unit)
+	local ok, err = pcall(TargetUnit, unit)
+	if ok then
+		EVH.diag("setTarget " .. tostring(unit) .. " ok")
+		return true, nil
+	end
+	local okU, same = pcall(UnitIsUnit, "target", unit)
+	EVH.diag("setTarget " .. tostring(unit) .. " threw; same=" .. tostring(same)
+		.. " err=" .. string.sub(tostring(err) or "?", 1, 100))
+	if okU and same then return true, err end
+	return false, err
+end
+
+-- cast a bound action slot on a unit (safe target juggling).
+-- Primary path: cast by spell name via CastSpellByName (works in Emberveil,
+-- which does not protect casting functions). Falls back to UseAction(slot)
+-- when the slot cannot be resolved to a spell name (item/macro/empty).
 function EVH.castUnit(unit, slot)
+	EVH.diag("castUnit unit=" .. tostring(unit) .. " slot=" .. tostring(slot))
 	if not slot then
-		TargetUnit(unit)
+		EVH.setTargetSafe(unit)
 		return
 	end
-	if not UnitExists(unit) then return end
-	if not HasAction(slot) then
+	-- every client API in here is probed first: a missing global must log a
+	-- diag line and degrade gracefully, not abort the whole click
+	local okE, ex = pcall(UnitExists, unit)
+	if not okE then
+		EVH.diag("UnitExists API err: " .. tostring(ex))
+	elseif not ex then
+		EVH.diag("abort: unit does not exist")
+		return
+	end
+	local okH, ha = pcall(HasAction, slot)
+	if not okH then EVH.diag("HasAction API err: " .. tostring(ha)) ha = true end
+	if not ha then
+		EVH.diag("abort: slot " .. tostring(slot) .. " has no action")
 		EVH.echo(L.slotInvalid)
 		return
 	end
-	if UnitIsDeadOrGhost(unit) then
+	local okD, dead = pcall(UnitIsDeadOrGhost, unit)
+	if not okD then EVH.diag("UnitIsDeadOrGhost API err: " .. tostring(dead)) dead = false end
+	if dead then
+		EVH.diag("abort: unit dead")
 		EVH.echo(L.dead)
 		return
 	end
-	if unit == "player" then
-		if IsUsableAction(slot) then
-			UseAction(slot, nil, 1)
-		else
-			EVH.echo(L.notUsable)
+
+	-- try to cast by resolved spell name/id (target-preserving).
+	-- Three tiers so a single rejected API cannot kill click-casting:
+	--   1) CastSpellByName(name)   2) CastSpell(id, "spell")   3) UseAction(slot)
+	-- The target is set once, up front: re-targeting per tier would fire the
+	-- client's target-change dispatch again for nothing.
+	local castByName = function(targetUnit)
+		local nm, id = EVH.slotSpellInfo(slot, true)
+		if not nm and not id then
+			-- GetActionInfo/GetSpellName path empty: fall back to naming the
+			-- action through its tooltip, which still yields a castable name
+			nm = EVH.slotName(slot)
+			if nm then EVH.diag("slotInfo empty; tooltip name=" .. tostring(nm)) end
 		end
+		if not nm and not id then
+			EVH.diag("castByName: no spell resolvable for slot " .. tostring(slot))
+			return false
+		end
+		local okT, terr = EVH.setTargetSafe(targetUnit)
+		if not okT then
+			EVH.diag("abort: target not set: " .. string.sub(tostring(terr) or "?", 1, 100))
+			if EVH.clickDebug then
+				EVH.dbug("dbg target failed: " .. tostring(terr))
+			end
+			return false
+		end
+		local okC, cerr = pcall(function()
+			if nm then
+				CastSpellByName(nm)
+			else
+				CastSpell(id, "spell")
+			end
+		end)
+		if okC then
+			EVH.diag("cast1 ok spell=" .. tostring(nm or id) .. " on=" .. tostring(targetUnit))
+			if EVH.clickDebug then
+				EVH.dbug("dbg cast: slot=" .. tostring(slot) .. " spell=" .. tostring(nm or id) .. " on=" .. tostring(targetUnit))
+			end
+			return true
+		end
+		EVH.diag("cast1 FAILED spell=" .. tostring(nm or id)
+			.. " err=" .. string.sub(tostring(cerr) or "?", 1, 120))
+		-- tier 2: cast by spell id (the name lookup can come back empty)
+		if id then
+			okC, cerr = pcall(function() CastSpell(id, "spell") end)
+			if okC then
+				EVH.diag("cast2(id) ok id=" .. tostring(id) .. " on=" .. tostring(targetUnit))
+				if EVH.clickDebug then
+					EVH.dbug("dbg cast(id): slot=" .. tostring(slot) .. " id=" .. tostring(id) .. " on=" .. tostring(targetUnit))
+				end
+				return true
+			end
+			EVH.diag("cast2(id) FAILED err=" .. string.sub(tostring(cerr) or "?", 1, 120))
+		end
+		if EVH.clickDebug then
+			EVH.dbug("dbg cast failed slot=" .. tostring(slot) .. " spell=" .. tostring(nm or id) .. " err=" .. tostring(cerr))
+		end
+		return false
+	end
+
+	-- restore the previous target; the target-change dispatch can throw here
+	-- too, and a failed restore must not mask a cast that already happened
+	local restore = function(prevName)
+		EVH.diag("restore prev=" .. tostring(prevName)
+			.. " tbn=" .. type(TargetByName) .. " ct=" .. type(ClearTarget))
+		pcall(function()
+			if prevName then TargetByName(prevName) else ClearTarget() end
+		end)
+	end
+
+	if unit == "player" then
+		local prevName = UnitExists("target") and UnitName("target") or nil
+		if not castByName("player") then
+			EVH.diag("self cast by name failed; UseAction fallback")
+			local okUs, usable = pcall(IsUsableAction, slot)
+			if not okUs then EVH.diag("IsUsableAction API err: " .. tostring(usable)) usable = true end
+			if usable then
+				local okA, aerr = pcall(UseAction, slot, nil, 1)
+				EVH.diag("useAction(self) ok=" .. tostring(okA)
+					.. (okA and "" or (" err=" .. string.sub(tostring(aerr) or "?", 1, 100))))
+			else
+				EVH.diag("abort: self cast not usable")
+				EVH.echo(L.notUsable)
+			end
+		end
+		restore(prevName)
 		return
 	end
-	local hadTarget = UnitExists("target")
-	local prevName = hadTarget and UnitName("target") or nil
-	local restore = function()
-		if prevName then TargetByName(prevName) else ClearTarget() end
+
+	local prevName = UnitExists("target") and UnitName("target") or nil
+	if not castByName(unit) then
+		EVH.diag("castByName failed; UseAction fallback")
+		local okT = EVH.setTargetSafe(unit)
+		local okU, same = pcall(UnitIsUnit, "target", unit)
+		if not okT or not okU or not same then
+			EVH.diag("abort: target not set in fallback (ok=" .. tostring(okT)
+				.. " same=" .. tostring(same) .. ")")
+			EVH.echo(L.noTarget)
+			restore(prevName)
+			return
+		end
+		local okR, inRange = pcall(IsActionInRange, slot)
+		if not okR then EVH.diag("IsActionInRange API err: " .. tostring(inRange)) inRange = nil end
+		if inRange == 0 then
+			EVH.diag("abort: out of range")
+			EVH.echo(L.outOfRange .. " [" .. (UnitName(unit) or "?") .. "]")
+			restore(prevName)
+			return
+		end
+		local okUs, usable = pcall(IsUsableAction, slot)
+		if not okUs then EVH.diag("IsUsableAction API err: " .. tostring(usable)) usable = true end
+		if not usable then
+			EVH.diag("abort: not usable")
+			EVH.echo(L.notUsable .. " [" .. (UnitName(unit) or "?") .. "]")
+			restore(prevName)
+			return
+		end
+		local okA, aerr = pcall(UseAction, slot)
+		EVH.diag("useAction ok=" .. tostring(okA)
+			.. (okA and "" or (" err=" .. string.sub(tostring(aerr) or "?", 1, 100))))
 	end
-	TargetUnit(unit)
-	if not UnitIsUnit("target", unit) then
-		EVH.echo(L.noTarget)
-		restore()
-		return
-	end
-	local inRange = IsActionInRange(slot)
-	if inRange == 0 then
-		EVH.echo(L.outOfRange .. " [" .. (UnitName(unit) or "?") .. "]")
-		restore()
-		return
-	end
-	if not IsUsableAction(slot) then
-		EVH.echo(L.notUsable .. " [" .. (UnitName(unit) or "?") .. "]")
-		restore()
-		return
-	end
-	UseAction(slot)
-	restore()
+	restore(prevName)
 end
 
 -- button name resolution for OnClick handlers
@@ -714,15 +993,24 @@ end
 -- main click handler used by unit buttons
 local function handleUnitClickImpl(button, a1, arg1)
 	local unit = button.evhMember and button.evhMember.unit
-	if not unit then return end
+	if not unit then
+		EVH.diag("click with no evhMember unit")
+		return
+	end
 	local btn = EVH.resolveButton(a1, arg1)
-	local slot = db.clicks[EVH.clickKey(btn, EVH.currentMods())]
+	local key = EVH.clickKey(btn, EVH.currentMods())
+	local slot = db.clicks[key]
+	EVH.diag("dispatch unit=" .. tostring(unit)
+		.. " name=" .. tostring(button.evhMember.name)
+		.. " btn=" .. tostring(btn) .. " key=" .. tostring(key)
+		.. " slot=" .. tostring(slot))
 	if EVH.clickDebug then
-		EVH.dbug("dbg cast: unit=" .. tostring(unit) .. " btn=" .. tostring(btn) .. " slot=" .. tostring(slot))
+		EVH.dbug("dbg cast: unit=" .. tostring(unit) .. " btn=" .. tostring(btn) .. " slot=" .. tostring(slot) .. " spell=" .. tostring(EVH.slotSpellName(slot)))
 	end
 	if slot then
 		EVH.castUnit(unit, slot)
 	else
+		EVH.diag("no bind for key=" .. tostring(key) .. "; targeting only")
 		TargetUnit(unit)
 	end
 end
@@ -731,6 +1019,7 @@ end
 function EVH.handleUnitClick(button, a1, arg1)
 	local ok, err = pcall(handleUnitClickImpl, button, a1, arg1)
 	if not ok then
+		EVH.diag("dispatch ERROR: " .. string.sub(tostring(err) or "?", 1, 160))
 		EVH.echo("|cffff5050EmberHeal: " .. tostring(err) .. "|r")
 	end
 end
